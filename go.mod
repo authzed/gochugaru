@@ -1,6 +1,6 @@
 module github.com/jzelinskie/gochugaru
 
-go 1.21.6
+go 1.23
 
 require (
 	github.com/authzed/authzed-go v0.11.1

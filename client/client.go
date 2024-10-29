@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"strings"
 	"time"
 
@@ -233,6 +234,31 @@ func (c *Client) Check(ctx context.Context, cs *consistency.Strategy, rs ...rel.
 		}
 	}
 	return results, nil
+}
+
+// FilterRelationships returns an iterator for all of the relationships
+// matching the provided filter.
+func (c *Client) FilterRelationships(ctx context.Context, cs *consistency.Strategy, f *rel.Filter) (iter.Seq2[*rel.Relationship, error], error) {
+	stream, err := c.client.ReadRelationships(ctx, &v1.ReadRelationshipsRequest{
+		Consistency:        cs.V1Consistency,
+		RelationshipFilter: f.V1Filter,
+		// TODO(jzelinskie): handle pagination for folks
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return func(yield func(*rel.Relationship, error) bool) {
+		for resp, err := stream.Recv(); err != io.EOF; resp, err = stream.Recv() {
+			if err != nil {
+				yield(nil, err)
+				return
+			} else if err := stream.Context().Err(); err != nil {
+				yield(nil, err)
+			}
+			yield(rel.FromV1Proto(resp.Relationship), nil)
+		}
+	}, nil
 }
 
 // ForEachRelationship calls the provided function for each relationship
