@@ -23,8 +23,8 @@ import (
 
 	_ "github.com/mostynb/go-grpc-compression/experimental/s2" // Register Snappy S2 compression
 
-	"github.com/jzelinskie/gochugaru/consistency"
-	"github.com/jzelinskie/gochugaru/rel"
+	"github.com/authzed/gochugaru/consistency"
+	"github.com/authzed/gochugaru/rel"
 )
 
 var defaultClientOpts = []grpc.DialOption{

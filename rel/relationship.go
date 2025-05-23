@@ -40,6 +40,42 @@ func (r Relationship) Caveat() (name string, context map[string]any, exists bool
 	return r.CaveatName, r.CaveatContext, r.HasCaveat()
 }
 
+func (r Relationship) String() string {
+	var b strings.Builder
+	b.WriteString(r.ResourceType)
+	b.WriteString(":")
+	b.WriteString(r.ResourceID)
+	b.WriteString("#")
+	b.WriteString(r.ResourceRelation)
+	b.WriteString("@")
+	b.WriteString(r.SubjectType)
+	b.WriteString(":")
+	b.WriteString(r.SubjectID)
+	if r.SubjectRelation != "" {
+		b.WriteString("#")
+		b.WriteString(r.SubjectRelation)
+	}
+	if r.HasCaveat() {
+		b.WriteString("[")
+		b.WriteString(r.CaveatName)
+		if len(r.CaveatContext) > 0 {
+			cc, err := structpb.NewStruct(r.CaveatContext)
+			if err != nil {
+				panic("caveat created with non-utf8 context key")
+			}
+
+			b.WriteString(":")
+			ccBytes, err := cc.MarshalJSON()
+			if err != nil {
+				panic(err)
+			}
+			b.Write(ccBytes)
+		}
+		b.WriteString("]")
+	}
+	return b.String()
+}
+
 func (r Relationship) WithCaveat(name string, context map[string]any) Relationship {
 	return Relationship{
 		ResourceType:     r.ResourceType,

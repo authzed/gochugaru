@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/jzelinskie/gochugaru/rel"
+	"github.com/authzed/gochugaru/rel"
 )
 
 func TestRelationshipParsingTriples(t *testing.T) {
@@ -27,11 +27,11 @@ func TestRelationshipParsingTriples(t *testing.T) {
 	}
 }
 
-func ExampleMustRelationshipFromTriple() {
+func ExampleMustFromTriple() {
 	r := rel.MustFromTriple("document:example", "viewer", "user:jzelinskie")
 	fmt.Println(r)
 	// Output:
-	// {document example viewer user jzelinskie   map[]}
+	// document:example#viewer@user:jzelinskie
 }
 
 func ExampleRelationship_WithCaveat() {
@@ -40,5 +40,5 @@ func ExampleRelationship_WithCaveat() {
 		WithCaveat("only_on_tuesday", map[string]any{"day_of_the_week": "wednesday"}),
 	)
 	// Output:
-	// {document example viewer user jzelinskie  only_on_tuesday map[day_of_the_week:wednesday]}
+	// document:example#viewer@user:jzelinskie[only_on_tuesday:{"day_of_the_week":"wednesday"}]
 }
