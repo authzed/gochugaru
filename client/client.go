@@ -55,7 +55,7 @@ func NewSystemTLS(endpoint, presharedKey string) (*Client, error) {
 	return NewWithOpts(endpoint, append(
 		defaultClientOpts,
 		withSystemCerts,
-		grpcutil.WithBearerToken("t_your_token_here_1234567deadbeef"),
+		grpcutil.WithBearerToken(presharedKey),
 	)...)
 }
 
