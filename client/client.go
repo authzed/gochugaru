@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	_ "github.com/mostynb/go-grpc-compression/experimental/s2" // Register Snappy S2 compression
 
@@ -121,6 +122,167 @@ func (c *Client) CheckAll(ctx context.Context, cs *consistency.Strategy, rs []re
 		}
 	}
 	return true, nil
+}
+
+// LookupResourcesOpts is a functional option for LookupResources.
+type LookupResourcesOpts func(*v1.LookupResourcesRequest) error
+
+// WithLRLimit configures the LookupResources request to limit the number of
+// resources returned.
+func WithLRLimit(limit uint32) LookupResourcesOpts {
+	return func(req *v1.LookupResourcesRequest) error {
+		req.OptionalLimit = limit
+		return nil
+	}
+}
+
+// WithLRCursor configures the LookupResources request to include a cursor
+// for pagination.
+func WithLRCursor(cursor *v1.Cursor) LookupResourcesOpts {
+	return func(req *v1.LookupResourcesRequest) error {
+		if req.OptionalCursor != nil {
+			return fmt.Errorf("cursor already set in LookupResources request")
+		}
+
+		req.OptionalCursor = cursor
+		return nil
+	}
+}
+
+// WithLRCaveatContext configures the LookupResources request to include a caveat context.
+func WithLRCaveatContext(caveatCtx map[string]any) LookupResourcesOpts {
+	return func(req *v1.LookupResourcesRequest) error {
+		c, err := structpb.NewStruct(caveatCtx)
+		if err != nil {
+			return fmt.Errorf("failed to convert caveat context: %w", err)
+		}
+
+		req.Context = c
+		return nil
+	}
+}
+
+// FoundResource represents a resource found by the LookupResources method.
+//
+// It is up to the caller to determine if the resource was found absolutely,
+// or is a conditional result.
+type FoundResource struct {
+	resourceObjectID           string
+	nextResourceCursor         *v1.Cursor
+	missingCaveatContextFields []string
+}
+
+// ResourceObjectID returns the resource object ID of the found resource. The boolean
+// indicates whether the resource was found absolutely (i.e., no missing caveat context fields).
+// If the boolean is false, the resource was found conditionally and the caller
+// should not assume the resource exists without the caveat context being further specified.
+func (fr FoundResource) ResourceObjectID() (string, bool) {
+	return fr.resourceObjectID, len(fr.missingCaveatContextFields) == 0
+}
+
+// Cursor returns the cursor for the next resource in the LookupResources request,
+// to be passed via WithLRCursor for pagination.
+func (fr FoundResource) Cursor() *v1.Cursor {
+	return fr.nextResourceCursor
+}
+
+// MissingCaveatContextFields returns the list of caveat context fields that were
+// missing for the LookupResources request, for this resource.
+func (fr FoundResource) MissingCaveatContextFields() []string {
+	return fr.missingCaveatContextFields
+}
+
+// PaginatedLookupResources performs a lookup for resources that the subject has the
+// provided permission on, automatically handling pagination based on the given
+// page size.
+func (c *Client) PaginatedLookupResources(
+	ctx context.Context,
+	cs *consistency.Strategy,
+	resourceType string,
+	permission string,
+	subject rel.Subject,
+	pageSize uint32,
+	opts ...LookupResourcesOpts,
+) iter.Seq2[FoundResource, error] {
+	return func(yield func(FoundResource, error) bool) {
+		var currentCursor *v1.Cursor
+		for {
+			foundResourceCount := 0
+			updatedOpts := append([]LookupResourcesOpts{WithLRLimit(pageSize), WithLRCursor(currentCursor)}, opts...)
+			it := c.LookupResources(ctx, cs, resourceType, permission, subject, updatedOpts...)
+			for fr, err := range it {
+				if !yield(fr, err) {
+					return
+				}
+				foundResourceCount++
+				currentCursor = fr.Cursor()
+			}
+			if foundResourceCount < int(pageSize) {
+				break
+			}
+		}
+	}
+}
+
+// LookupResources performs a lookup for resources that the subject has the
+// provided permission on.
+func (c *Client) LookupResources(
+	ctx context.Context,
+	cs *consistency.Strategy,
+	resourceType string,
+	permission string,
+	subject rel.Subject,
+	opts ...LookupResourcesOpts,
+) iter.Seq2[FoundResource, error] {
+	req := &v1.LookupResourcesRequest{
+		ResourceObjectType: resourceType,
+		Permission:         permission,
+		Subject: &v1.SubjectReference{
+			Object: &v1.ObjectReference{
+				ObjectType: subject.Type,
+				ObjectId:   subject.ID,
+			},
+			OptionalRelation: subject.Relation,
+		},
+		Consistency: cs.V1Consistency,
+	}
+
+	for _, opt := range opts {
+		opt(req)
+	}
+
+	return func(yield func(FoundResource, error) bool) {
+		stream, err := c.client.LookupResources(ctx, req)
+		if err != nil {
+			_ = yield(FoundResource{}, err)
+			return
+		}
+
+		for {
+			resp, err := stream.Recv()
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return
+				}
+
+				_ = yield(FoundResource{}, fmt.Errorf("error receiving LookupResources response: %w", err))
+				return
+			}
+
+			found := FoundResource{
+				resourceObjectID:   resp.ResourceObjectId,
+				nextResourceCursor: resp.AfterResultCursor,
+			}
+
+			if resp.Permissionship != v1.LookupPermissionship_LOOKUP_PERMISSIONSHIP_HAS_PERMISSION {
+				found.missingCaveatContextFields = resp.PartialCaveatInfo.MissingRequiredContext
+			}
+
+			if !yield(found, nil) {
+				return
+			}
+		}
+	}
 }
 
 // withBackoffRetriesAndTimeout is a utility to wrap an API call with retry
@@ -251,12 +413,17 @@ func (c *Client) FilterRelationships(ctx context.Context, cs *consistency.Strate
 	return func(yield func(*rel.Relationship, error) bool) {
 		for resp, err := stream.Recv(); err != io.EOF; resp, err = stream.Recv() {
 			if err != nil {
-				yield(nil, err)
+				_ = yield(nil, err)
 				return
 			} else if err := stream.Context().Err(); err != nil {
-				yield(nil, err)
+				if !yield(nil, err) {
+					return
+				}
 			}
-			yield(rel.FromV1Proto(resp.Relationship), nil)
+
+			if !yield(rel.FromV1Proto(resp.Relationship), nil) {
+				return
+			}
 		}
 	}, nil
 }
