@@ -327,60 +327,52 @@ func (c *Client) Delete(ctx context.Context, f *rel.PreconditionedFilter) error 
 	return nil
 }
 
-// ForEachUpdate performs subscribes to optionally-filtered updates out of the
-// SpiceDB Watch API calling the provided UpdateFunc for each result.
+// Updates returns an iterator that's subscribed to optionally-filtered updates
+// from the SpiceDB Watch API.
 //
 // This function can and should be cancelled via context.
-func (c *Client) ForEachUpdate(ctx context.Context, objTypes []string, fs []rel.Filter, fn rel.UpdateFunc) error {
-	return c.ForEachUpdateFromRevision(ctx, objTypes, fs, fn, "")
+func (c *Client) Updates(ctx context.Context, f rel.UpdateFilter) iter.Seq2[rel.Update, error] {
+	return c.UpdatesSinceRevision(ctx, f, "")
 }
 
-// ForEachUpdateFromRevision is the same as ForEachUpdate, but begins at a
-// specific revision onward.
-//
-// This function can and should be cancelled via context.
-func (c *Client) ForEachUpdateFromRevision(ctx context.Context, objTypes []string, fs []rel.Filter, fn rel.UpdateFunc, revision string) error {
-	v1filters := make([]*v1.RelationshipFilter, 0, len(fs))
-	for _, f := range fs {
-		v1filters = append(v1filters, f.V1Filter)
-	}
+// UpdatesSinceRevision is a variation of the Updates method that supports
+// starting the iterator at a specific revision.
+func (c *Client) UpdatesSinceRevision(ctx context.Context, f rel.UpdateFilter, revision string) iter.Seq2[rel.Update, error] {
+	return func(yield func(rel.Update, error) bool) {
+		v1filters := make([]*v1.RelationshipFilter, 0, len(f.RelationshipFilters))
+		for _, f := range f.RelationshipFilters {
+			v1filters = append(v1filters, f.V1Filter)
+		}
 
-	req := &v1.WatchRequest{
-		OptionalObjectTypes:         objTypes,
-		OptionalRelationshipFilters: v1filters,
-	}
-	if revision != "" {
-		req.OptionalStartCursor = &v1.ZedToken{Token: revision}
-	}
+		req := &v1.WatchRequest{
+			OptionalObjectTypes:         f.ObjectTypes,
+			OptionalRelationshipFilters: v1filters,
+		}
+		if revision != "" {
+			req.OptionalStartCursor = &v1.ZedToken{Token: revision}
+		}
 
-	watchStream, err := c.client.Watch(ctx, req)
-	if err != nil {
-		return err
-	}
+		watchStream, err := c.client.Watch(ctx, req)
+		if err != nil {
+			yield(rel.Update{}, err)
+			return
+		}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-			resp, err := watchStream.Recv()
-			if err != nil {
-				return err
-			}
-
-			for _, update := range resp.Updates {
-				updateType := rel.UpdateUnknown
-				switch update.Operation {
-				case v1.RelationshipUpdate_OPERATION_CREATE:
-					updateType = rel.UpdateCreate
-				case v1.RelationshipUpdate_OPERATION_DELETE:
-					updateType = rel.UpdateDelete
-				case v1.RelationshipUpdate_OPERATION_TOUCH:
-					updateType = rel.UpdateTouch
-				}
-				err = fn(updateType, rel.FromV1Proto(update.Relationship))
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				resp, err := watchStream.Recv()
 				if err != nil {
-					return err
+					yield(rel.Update{}, err)
+					return
+				}
+
+				for _, update := range resp.Updates {
+					if !yield(rel.UpdateFromV1Proto(update), nil) {
+						return
+					}
 				}
 			}
 		}

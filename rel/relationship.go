@@ -229,4 +229,34 @@ const (
 	UpdateTouch
 )
 
+func UpdateTypeFromV1Proto(typ v1.RelationshipUpdate_Operation) UpdateType {
+	switch typ {
+	case v1.RelationshipUpdate_OPERATION_CREATE:
+		return UpdateCreate
+	case v1.RelationshipUpdate_OPERATION_DELETE:
+		return UpdateDelete
+	case v1.RelationshipUpdate_OPERATION_TOUCH:
+		return UpdateTouch
+	default:
+		return UpdateUnknown
+	}
+}
+
 type UpdateFunc func(typ UpdateType, r *Relationship) error
+
+type Update struct {
+	UpdateType   UpdateType
+	Relationship Relationship
+}
+
+func UpdateFromV1Proto(u *v1.RelationshipUpdate) Update {
+	return Update{
+		UpdateType:   UpdateTypeFromV1Proto(u.Operation),
+		Relationship: *FromV1Proto(u.Relationship),
+	}
+}
+
+type UpdateFilter struct {
+	ObjectTypes         []string
+	RelationshipFilters []Filter
+}
