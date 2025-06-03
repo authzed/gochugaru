@@ -5,6 +5,7 @@ go 1.23
 require (
 	github.com/authzed/authzed-go v0.11.1
 	github.com/authzed/grpcutil v0.0.0-20230908193239-4286bb1d6403
+	github.com/google/uuid v1.6.0
 	github.com/mostynb/go-grpc-compression v1.2.2
 	golang.org/x/exp v0.0.0-20240416160154-fe59bbe5cc7f
 	google.golang.org/grpc v1.62.1
@@ -54,7 +55,7 @@ require (
 	github.com/klauspost/compress v1.17.0 // indirect
 	github.com/ory/dockertest/v3 v3.11.0
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/stretchr/testify v1.9.0 // indirect
+	github.com/stretchr/testify v1.9.0
 	golang.org/x/net v0.24.0 // indirect
 	golang.org/x/sys v0.26.0 // indirect
 	golang.org/x/text v0.14.0 // indirect

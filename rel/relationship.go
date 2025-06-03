@@ -150,10 +150,12 @@ func (r Relationship) MustV1ProtoCaveat() *v1.ContextualizedCaveat {
 }
 
 type Object struct {
-	Typ      string
+	Type     string
 	ID       string
 	Relation string
 }
+
+type Subject Object
 
 func (o Object) Object() Object { return o }
 
@@ -162,10 +164,10 @@ type Objecter interface{ Object() Object }
 func FromObjects(resource, subject Objecter) Relationship {
 	r, s := resource.Object(), subject.Object()
 	return Relationship{
-		ResourceType:     r.Typ,
+		ResourceType:     r.Type,
 		ResourceID:       r.ID,
 		ResourceRelation: r.Relation,
-		SubjectType:      s.Typ,
+		SubjectType:      s.Type,
 		SubjectID:        s.ID,
 		SubjectRelation:  s.Relation,
 	}
