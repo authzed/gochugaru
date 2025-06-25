@@ -4,16 +4,20 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/authzed/gochugaru/client"
 	"github.com/authzed/gochugaru/consistency"
 	"github.com/authzed/gochugaru/rel"
+	"github.com/authzed/grpcutil"
 	"github.com/google/uuid"
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 const exampleSchema = `
@@ -84,14 +88,11 @@ func ExampleClient_FilterRelationships() {
 		panic(err)
 	}
 
-	iter, err := c.FilterRelationships(
+	iter := c.FilterRelationships(
 		ctx,
 		consistency.MinLatency(),
 		rel.NewFilter("document", "", ""),
 	)
-	if err != nil {
-		panic(err)
-	}
 
 	for r, err := range iter {
 		if err != nil {
@@ -101,6 +102,40 @@ func ExampleClient_FilterRelationships() {
 	}
 	// Output:
 	// document:README#reader@user:jimmy
+}
+
+func TestClient_LookupResources(t *testing.T) {
+	ctx := context.TODO()
+
+	c, err := client.NewPlaintext("127.0.0.1:50051", randomPresharedKey())
+	require.NoError(t, err, "Failed to create client")
+
+	_, err = c.WriteSchema(ctx, exampleSchema)
+	require.NoError(t, err, "Failed to write schema")
+
+	var txn rel.Txn
+	txn.Create(rel.MustFromTriple("document:check_test1", "writer", "user:alice"))
+	txn.Create(rel.MustFromTriple("document:check_test1", "reader", "user:bob"))
+	txn.Create(rel.MustFromTriple("document:check_test1", "writer", "user:charlie"))
+	txn.Create(rel.MustFromTriple("document:check_test2", "writer", "user:charlie"))
+	_, err = c.Write(ctx, &txn)
+	require.NoError(t, err, "Failed to write relationships")
+
+	t.Run("lookup resources - document objects returned", func(t *testing.T) {
+		for id, err := range c.LookupResources(ctx, consistency.Full(), "document#writer", "user:alice") {
+			require.NoError(t, err, "Lookup failed")
+			require.Equal(t, "check_test1", id)
+		}
+	})
+	t.Run("lookup resources - multiple objects returned", func(t *testing.T) {
+		var ids []string
+		for id, err := range c.LookupResources(ctx, consistency.Full(), "document#writer", "user:charlie") {
+			require.NoError(t, err, "Lookup failed")
+			ids = append(ids, id)
+		}
+		slices.Sort(ids)
+		require.Equal(t, []string{"check_test1", "check_test2"}, ids)
+	})
 }
 
 func TestClient_Check(t *testing.T) {
@@ -177,5 +212,61 @@ func TestClient_Check(t *testing.T) {
 		require.NoError(t, err, "Check failed")
 		require.Len(t, results, 1, "Expected 1 result")
 		require.False(t, results[0], "Expected no permission on nonexistent resource")
+	})
+}
+
+func TestMissingOverlapPanic(t *testing.T) {
+	ctx := context.TODO()
+
+	c, err := client.NewWithOpts("127.0.0.1:50051",
+		client.WithOverlapRequired(),
+		client.WithDialOpts(
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpcutil.WithInsecureBearerToken(randomPresharedKey()),
+		),
+	)
+	require.NoError(t, err, "Failed to create client")
+
+	_, err = c.WriteSchema(ctx, exampleSchema)
+	require.NoError(t, err, "Failed to write schema")
+
+	t.Run("Missing Overlap Panics - ReadRelationships", func(t *testing.T) {
+		defer func() { _ = recover() }()
+		_ = c.FilterRelationships(ctx, consistency.Full(), rel.NewFilter("document", "", ""))
+		t.Fatal("did not panic when overlap not provided")
+	})
+	t.Run("Missing Overlap Panics - ExportRelationships", func(t *testing.T) {
+		defer func() { _ = recover() }()
+		_ = c.ExportRelationships(ctx, func(r *rel.Relationship) error { return nil }, "")
+		t.Fatal("did not panic when overlap not provided")
+	})
+
+	t.Run("Missing Overlap Panics - Check", func(t *testing.T) {
+		defer func() { _ = recover() }()
+		_, _ = c.CheckOne(ctx, consistency.Full(), rel.MustFromTriple("document:README", "owner", "user:bot"))
+		t.Fatal("did not panic when overlap not provided")
+	})
+
+	t.Run("Missing Overlap Panics - DeleteAtomic", func(t *testing.T) {
+		defer func() { _ = recover() }()
+		_, _ = c.DeleteAtomic(ctx, rel.NewPreconditionedFilter(rel.NewFilter("document", "", "")))
+		t.Fatal("did not panic when overlap not provided")
+	})
+	t.Run("Missing Overlap Panics - Delete", func(t *testing.T) {
+		defer func() { _ = recover() }()
+		_ = c.Delete(ctx, rel.NewPreconditionedFilter(rel.NewFilter("document", "", "")))
+		t.Fatal("did not panic when overlap not provided")
+	})
+
+	t.Run("Missing Overlap Panics - Updates", func(t *testing.T) {
+		defer func() { _ = recover() }()
+		_ = c.Updates(ctx, rel.UpdateFilter{})
+		t.Fatal("did not panic when overlap not provided")
+	})
+
+	t.Run("Missing Overlap Panics - LookupResources", func(t *testing.T) {
+		defer func() { _ = recover() }()
+		_ = c.LookupResources(ctx, consistency.Full(), "document#writer", "user:alice")
+		t.Fatal("did not panic when overlap not provided")
 	})
 }

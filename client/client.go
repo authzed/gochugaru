@@ -11,10 +11,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authzed/authzed-go/pkg/requestmeta"
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 	"github.com/authzed/authzed-go/v1"
 	"github.com/authzed/grpcutil"
 	"github.com/cenkalti/backoff/v4"
+	"github.com/jzelinskie/stringz"
 	"golang.org/x/exp/slices"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -35,11 +37,11 @@ var defaultClientOpts = []grpc.DialOption{
 //
 // This should be used only for testing (usually against localhost).
 func NewPlaintext(endpoint, presharedKey string) (*Client, error) {
-	return NewWithOpts(endpoint, append(
+	return NewWithOpts(endpoint, WithDialOpts(append(
 		defaultClientOpts,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpcutil.WithInsecureBearerToken(presharedKey),
-	)...)
+	)...))
 }
 
 // NewSystemTLS creates a client using TLS verified by the operating
@@ -52,29 +54,64 @@ func NewSystemTLS(endpoint, presharedKey string) (*Client, error) {
 		return nil, err
 	}
 
-	return NewWithOpts(endpoint, append(
+	return NewWithOpts(endpoint, WithDialOpts(append(
 		defaultClientOpts,
 		withSystemCerts,
 		grpcutil.WithBearerToken(presharedKey),
-	)...)
+	)...))
 }
 
-// NewWithOpts creates a client that allows for configuring gRPC options.
+// NewWithOpts creates a new client with the defaults overwritten with any
+// provided options.
+func NewWithOpts(endpoint string, opts ...Option) (*Client, error) {
+	c := newWithDefaults()
+	for _, opt := range opts {
+		opt(c)
+	}
+
+	if err := c.connect(endpoint); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+type Option func(client *Client)
+
+// WithOverlapRequired will cause a panic if a request is made that does not
+// provide an overlap key.
+//
+// This should be used to prevent any issues when SpiceDB is configured for
+// overlap keys provided from requests.
+func WithOverlapRequired() Option {
+	return func(client *Client) { client.overlapRequired = true }
+}
+
+// WithDialOpts allows for configuring the underlying gRPC connection.
 //
 // This should only be used if the other methods don't suffice.
 //
-// I'd love to hear about what DialOptions you're using in the SpiceDB Discord
-// (https://discord.gg/spicedb) or the issue tracker for this library.
-func NewWithOpts(endpoint string, opts ...grpc.DialOption) (*Client, error) {
-	client, err := authzed.NewClientWithExperimentalAPIs(endpoint, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return &Client{client: client}, nil
+// We'd also love to hear about which DialOptions you're using in the
+// SpiceDB Discord (https://discord.gg/spicedb) or the issue tracker for this
+// library.
+func WithDialOpts(opts ...grpc.DialOption) Option {
+	return func(client *Client) { client.dialOpts = opts }
 }
 
+type RequestOption func(context.Context)
+
 type Client struct {
-	client *authzed.ClientWithExperimental
+	client          *authzed.ClientWithExperimental
+	dialOpts        []grpc.DialOption
+	overlapRequired bool
+}
+
+func newWithDefaults() *Client {
+	return &Client{dialOpts: defaultClientOpts}
+}
+
+func (c *Client) connect(endpoint string) (err error) {
+	c.client, err = authzed.NewClientWithExperimentalAPIs(endpoint, c.dialOpts...)
+	return err
 }
 
 // Write atomically performs a transaction on relationships.
@@ -121,6 +158,14 @@ func (c *Client) CheckAll(ctx context.Context, cs *consistency.Strategy, rs []re
 		}
 	}
 	return true, nil
+}
+
+func (c *Client) checkOverlap(ctx context.Context) {
+	if c.overlapRequired {
+		if val := ctx.Value(requestmeta.RequestOverlapKey); val.(string) != "" {
+			panic("failed to configure required overlap key for request")
+		}
+	}
 }
 
 // withBackoffRetriesAndTimeout is a utility to wrap an API call with retry
@@ -195,6 +240,8 @@ func errContains(err error, errStrs ...string) bool {
 
 // Check performs a batched permissions check for the provided relationships.
 func (c *Client) Check(ctx context.Context, cs *consistency.Strategy, rs ...rel.Interface) ([]bool, error) {
+	c.checkOverlap(ctx)
+
 	items := make([]*v1.CheckBulkPermissionsRequestItem, 0, len(rs))
 	for _, ir := range rs {
 		r := ir.Relationship()
@@ -248,57 +295,40 @@ func (c *Client) Check(ctx context.Context, cs *consistency.Strategy, rs ...rel.
 
 // FilterRelationships returns an iterator for all of the relationships
 // matching the provided filter.
-func (c *Client) FilterRelationships(ctx context.Context, cs *consistency.Strategy, f *rel.Filter) (iter.Seq2[*rel.Relationship, error], error) {
-	stream, err := c.client.ReadRelationships(ctx, &v1.ReadRelationshipsRequest{
-		Consistency:        cs.V1Consistency,
-		RelationshipFilter: f.V1Filter,
-		// TODO(jzelinskie): handle pagination for folks
-	})
-	if err != nil {
-		return nil, err
-	}
+func (c *Client) FilterRelationships(ctx context.Context, cs *consistency.Strategy, f *rel.Filter) iter.Seq2[*rel.Relationship, error] {
+	c.checkOverlap(ctx)
 
 	return func(yield func(*rel.Relationship, error) bool) {
+		stream, err := c.client.ReadRelationships(ctx, &v1.ReadRelationshipsRequest{
+			Consistency:        cs.V1Consistency,
+			RelationshipFilter: f.V1Filter,
+			OptionalLimit:      512,
+		})
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+
 		for resp, err := stream.Recv(); err != io.EOF; resp, err = stream.Recv() {
 			if err != nil {
 				yield(nil, err)
 				return
 			} else if err := stream.Context().Err(); err != nil {
 				yield(nil, err)
+				return
 			}
-			yield(rel.FromV1Proto(resp.Relationship), nil)
-		}
-	}, nil
-}
-
-// ForEachRelationship calls the provided function for each relationship
-// matching the provided filter.
-func (c *Client) ForEachRelationship(ctx context.Context, cs *consistency.Strategy, f *rel.Filter, fn rel.Func) error {
-	stream, err := c.client.ReadRelationships(ctx, &v1.ReadRelationshipsRequest{
-		Consistency:        cs.V1Consistency,
-		RelationshipFilter: f.V1Filter,
-		// TODO(jzelinskie): handle pagination for folks
-	})
-	if err != nil {
-		return err
-	}
-
-	for resp, err := stream.Recv(); err != io.EOF; resp, err = stream.Recv() {
-		if err != nil {
-			return err
-		}
-
-		if err := fn(rel.FromV1Proto(resp.Relationship)); err != nil {
-			return err
+			if !yield(rel.FromV1Proto(resp.Relationship), nil) {
+				return
+			}
 		}
 	}
-
-	return nil
 }
 
 // DeleteAtomic removes all of the relationships matching the provided filter
 // in a single transaction.
 func (c *Client) DeleteAtomic(ctx context.Context, f *rel.PreconditionedFilter) (deletedAtRevision string, err error) {
+	c.checkOverlap(ctx)
+
 	// Explicitly given no back-off or retry logic.
 	resp, err := c.client.DeleteRelationships(ctx, &v1.DeleteRelationshipsRequest{
 		RelationshipFilter:            f.V1Filter,
@@ -318,6 +348,8 @@ func (c *Client) DeleteAtomic(ctx context.Context, f *rel.PreconditionedFilter) 
 // Delete removes all of the relationships matching the provided filter in
 // batches.
 func (c *Client) Delete(ctx context.Context, f *rel.PreconditionedFilter) error {
+	c.checkOverlap(ctx)
+
 	for {
 		var resp *v1.DeleteRelationshipsResponse
 		if err := withBackoffRetriesAndTimeout(ctx, func(cCtx context.Context) (cErr error) {
@@ -348,6 +380,8 @@ func (c *Client) Updates(ctx context.Context, f rel.UpdateFilter) iter.Seq2[rel.
 // UpdatesSinceRevision is a variation of the Updates method that supports
 // starting the iterator at a specific revision.
 func (c *Client) UpdatesSinceRevision(ctx context.Context, f rel.UpdateFilter, revision string) iter.Seq2[rel.Update, error] {
+	c.checkOverlap(ctx)
+
 	return func(yield func(rel.Update, error) bool) {
 		v1filters := make([]*v1.RelationshipFilter, 0, len(f.RelationshipFilters))
 		for _, f := range f.RelationshipFilters {
@@ -416,6 +450,8 @@ func (c *Client) WriteSchema(ctx context.Context, schema string) (revision strin
 // A proper backup should include relationships and schema, so this function
 // should be called with the same revision as said schema.
 func (c *Client) ExportRelationships(ctx context.Context, fn rel.Func, revision string) error {
+	c.checkOverlap(ctx)
+
 	relationshipStream, err := c.client.BulkExportRelationships(ctx, &v1.BulkExportRelationshipsRequest{
 		Consistency: &v1.Consistency{
 			Requirement: &v1.Consistency_AtExactSnapshot{
@@ -447,6 +483,80 @@ func (c *Client) ExportRelationships(ctx context.Context, fn rel.Func, revision 
 			for _, r := range relsResp.Relationships {
 				if err := fn(rel.FromV1Proto(r)); err != nil {
 					return err
+				}
+			}
+		}
+	}
+}
+
+// parseSubject parses the given subject string into its namespace, object ID
+// and relation, if valid.
+func parseSubject(s string) (subjType, id, relation string, err error) {
+	err = stringz.SplitExact(s, ":", &subjType, &id)
+	if err != nil {
+		return
+	}
+	err = stringz.SplitExact(id, "#", &id, &relation)
+	if err != nil {
+		relation = ""
+		err = nil
+	}
+	return
+}
+
+// LookupResources streams a sequence of resource IDs for which the provided
+// subject has permission.
+//
+// The permission and subject are provided as strings in the following format:
+// `LookupResources(ctx, consistency.MinLatency(), "document#reader" "user:jimmy")`
+// or
+// `LookupResources(ctx, consistency.MinLatency(), "document#reader" "team:admin#member")`
+func (c *Client) LookupResources(ctx context.Context, cs *consistency.Strategy, permission, subject string) iter.Seq2[string, error] {
+	c.checkOverlap(ctx)
+
+	return func(yield func(string, error) bool) {
+		subjType, subjID, subjRel, err := parseSubject(subject)
+		if err != nil {
+			yield("", err)
+			return
+		}
+
+		objType, objRel, found := strings.Cut(permission, "#")
+		if !found {
+			yield("", errors.New("invalid permission arg; must be in form `objectType#relation` (e.g. document#read)"))
+			return
+		}
+
+		stream, err := c.client.LookupResources(ctx, &v1.LookupResourcesRequest{
+			ResourceObjectType: objType,
+			Permission:         objRel,
+			Subject: &v1.SubjectReference{
+				Object: &v1.ObjectReference{
+					ObjectType: subjType,
+					ObjectId:   subjID,
+				},
+				OptionalRelation: subjRel,
+			},
+			Context:       nil, // TODO(jzelinskie): maybe caveats get injected into ctx?
+			Consistency:   cs.V1Consistency,
+			OptionalLimit: 512,
+		})
+		if err != nil {
+			yield("", err)
+			return
+		}
+
+		for {
+			resp, err := stream.Recv()
+			switch {
+			case errors.Is(err, io.EOF):
+				return
+			case err != nil:
+				yield("", err)
+				return
+			default:
+				if !yield(resp.ResourceObjectId, nil) {
+					return
 				}
 			}
 		}

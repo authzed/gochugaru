@@ -1,6 +1,11 @@
 package consistency
 
-import v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+import (
+	"context"
+
+	"github.com/authzed/authzed-go/pkg/requestmeta"
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+)
 
 // Strategy represents the strategy that a request can use in order to
 // trade-off speed with latency.
@@ -9,6 +14,12 @@ import v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 // https://en.wikipedia.org/wiki/PACELC_theorem
 type Strategy struct {
 	V1Consistency *v1.Consistency
+}
+
+// WithOverlapKey creates a new context including the SpiceDB overlap key that
+// will be used for subsequent requests.
+func WithOverlapKey(ctx context.Context, key string) context.Context {
+	return requestmeta.WithOverlapKey(ctx, key)
 }
 
 // Full configures the request to evaluate at the most recent
