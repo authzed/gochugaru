@@ -138,6 +138,11 @@ func withBackoffRetriesAndTimeout(ctx context.Context, fn func(context.Context) 
 	for retryCount := 0; ; retryCount++ {
 		cancelCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
 		err := fn(cancelCtx)
+		if err == nil {
+			cancel()
+			return nil
+		}
+
 		cancel()
 
 		if isRetriable(err) && retryCount < maxRetries {
@@ -190,10 +195,10 @@ func errContains(err error, errStrs ...string) bool {
 
 // Check performs a batched permissions check for the provided relationships.
 func (c *Client) Check(ctx context.Context, cs *consistency.Strategy, rs ...rel.Interface) ([]bool, error) {
-	items := make([]*v1.BulkCheckPermissionRequestItem, 0, len(rs))
+	items := make([]*v1.CheckBulkPermissionsRequestItem, 0, len(rs))
 	for _, ir := range rs {
 		r := ir.Relationship()
-		items = append(items, &v1.BulkCheckPermissionRequestItem{
+		items = append(items, &v1.CheckBulkPermissionsRequestItem{
 			Resource: &v1.ObjectReference{
 				ObjectType: r.ResourceType,
 				ObjectId:   r.ResourceID,
@@ -202,7 +207,7 @@ func (c *Client) Check(ctx context.Context, cs *consistency.Strategy, rs ...rel.
 			Subject: &v1.SubjectReference{
 				Object: &v1.ObjectReference{
 					ObjectType: r.SubjectType,
-					ObjectId:   r.SubjectRelation,
+					ObjectId:   r.SubjectID,
 				},
 				OptionalRelation: r.SubjectRelation,
 			},
@@ -210,26 +215,31 @@ func (c *Client) Check(ctx context.Context, cs *consistency.Strategy, rs ...rel.
 		})
 	}
 
-	var resp *v1.BulkCheckPermissionResponse
-	if err := withBackoffRetriesAndTimeout(ctx, func(cCtx context.Context) (cErr error) {
-		resp, cErr = c.client.BulkCheckPermission(cCtx, &v1.BulkCheckPermissionRequest{
+	var foundResp *v1.CheckBulkPermissionsResponse
+	if err := withBackoffRetriesAndTimeout(ctx, func(ctx context.Context) error {
+		resp, err := c.client.CheckBulkPermissions(ctx, &v1.CheckBulkPermissionsRequest{
 			Consistency: cs.V1Consistency,
 			Items:       items,
 		})
-		return cErr
+		if err != nil {
+			return err
+		}
+
+		foundResp = resp
+		return nil
 	}); err != nil {
 		return nil, err
 	}
 
 	var results []bool
-	for _, pair := range resp.Pairs {
+	for _, pair := range foundResp.Pairs {
 		switch resp := pair.Response.(type) {
-		case *v1.BulkCheckPermissionPair_Item:
+		case *v1.CheckBulkPermissionsPair_Item:
 			results = append(
 				results,
 				resp.Item.Permissionship == v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
 			)
-		case *v1.BulkCheckPermissionPair_Error:
+		case *v1.CheckBulkPermissionsPair_Error:
 			return results, errors.New(resp.Error.Message)
 		}
 	}

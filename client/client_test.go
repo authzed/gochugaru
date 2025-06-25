@@ -10,8 +10,10 @@ import (
 	"github.com/authzed/gochugaru/client"
 	"github.com/authzed/gochugaru/consistency"
 	"github.com/authzed/gochugaru/rel"
+	"github.com/google/uuid"
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
+	"github.com/stretchr/testify/require"
 )
 
 const exampleSchema = `
@@ -26,7 +28,7 @@ definition document {
 `
 
 func randomPresharedKey() string {
-	return "somerandomkeyhere"
+	return uuid.New().String()
 }
 
 func TestMain(m *testing.M) {
@@ -99,4 +101,81 @@ func ExampleClient_FilterRelationships() {
 	}
 	// Output:
 	// document:README#reader@user:jimmy
+}
+
+func TestClient_Check(t *testing.T) {
+	ctx := context.TODO()
+
+	c, err := client.NewPlaintext("127.0.0.1:50051", randomPresharedKey())
+	require.NoError(t, err, "Failed to create client")
+
+	_, err = c.WriteSchema(ctx, exampleSchema)
+	require.NoError(t, err, "Failed to write schema")
+
+	var txn rel.Txn
+	txn.Create(rel.MustFromTriple("document:check_test1", "writer", "user:alice"))
+	txn.Create(rel.MustFromTriple("document:check_test1", "reader", "user:bob"))
+	txn.Create(rel.MustFromTriple("document:check_test2", "writer", "user:charlie"))
+	_, err = c.Write(ctx, &txn)
+	require.NoError(t, err, "Failed to write relationships")
+
+	t.Run("single relationship check - has permission", func(t *testing.T) {
+		results, err := c.Check(ctx, consistency.MinLatency(),
+			rel.MustFromTriple("document:check_test1", "edit", "user:alice"))
+		require.NoError(t, err, "Check failed")
+		require.Len(t, results, 1, "Expected 1 result")
+		require.True(t, results[0], "Expected alice to have edit permission on document:check_test1")
+	})
+
+	t.Run("single relationship check - no permission", func(t *testing.T) {
+		results, err := c.Check(ctx, consistency.MinLatency(),
+			rel.MustFromTriple("document:check_test1", "edit", "user:bob"))
+		require.NoError(t, err, "Check failed")
+		require.Len(t, results, 1, "Expected 1 result")
+		require.False(t, results[0], "Expected bob to not have edit permission on document:check_test1")
+	})
+
+	t.Run("multiple relationships check", func(t *testing.T) {
+		results, err := c.Check(ctx, consistency.MinLatency(),
+			rel.MustFromTriple("document:check_test1", "edit", "user:alice"),
+			rel.MustFromTriple("document:check_test1", "view", "user:bob"),
+			rel.MustFromTriple("document:check_test2", "edit", "user:charlie"),
+			rel.MustFromTriple("document:check_test2", "view", "user:alice"))
+		require.NoError(t, err, "Check failed")
+		require.Len(t, results, 4, "Expected 4 results")
+
+		expected := []bool{true, true, true, false}
+		for i, expectedResult := range expected {
+			require.Equal(t, expectedResult, results[i], "Result %d mismatch", i)
+		}
+	})
+
+	t.Run("different consistency strategies", func(t *testing.T) {
+		strategies := []*consistency.Strategy{
+			consistency.MinLatency(),
+			consistency.Full(),
+		}
+
+		for _, strategy := range strategies {
+			results, err := c.Check(ctx, strategy,
+				rel.MustFromTriple("document:check_test1", "edit", "user:alice"))
+			require.NoError(t, err, "Check with consistency strategy failed")
+			require.Len(t, results, 1, "Expected 1 result")
+			require.True(t, results[0], "Expected alice to have edit permission on document:check_test1")
+		}
+	})
+
+	t.Run("empty relationships", func(t *testing.T) {
+		results, err := c.Check(ctx, consistency.MinLatency())
+		require.NoError(t, err, "Check with no relationships failed")
+		require.Len(t, results, 0, "Expected 0 results")
+	})
+
+	t.Run("nonexistent resource", func(t *testing.T) {
+		results, err := c.Check(ctx, consistency.MinLatency(),
+			rel.MustFromTriple("document:nonexistent", "edit", "user:alice"))
+		require.NoError(t, err, "Check failed")
+		require.Len(t, results, 1, "Expected 1 result")
+		require.False(t, results[0], "Expected no permission on nonexistent resource")
+	})
 }
