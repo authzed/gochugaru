@@ -269,4 +269,9 @@ func TestMissingOverlapPanic(t *testing.T) {
 		_ = c.LookupResources(ctx, consistency.Full(), "document#writer", "user:alice")
 		t.Fatal("did not panic when overlap not provided")
 	})
+
+	t.Run("Provided Overlap Doesn't Panic", func(t *testing.T) {
+		_, _ = c.CheckOne(consistency.WithOverlapKey(ctx, "test"),
+			consistency.Full(), rel.MustFromTriple("document:README", "owner", "user:bot"))
+	})
 }

@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	_ "github.com/mostynb/go-grpc-compression/experimental/s2" // Register Snappy S2 compression
@@ -162,9 +163,12 @@ func (c *Client) CheckAll(ctx context.Context, cs *consistency.Strategy, rs []re
 
 func (c *Client) checkOverlap(ctx context.Context) {
 	if c.overlapRequired {
-		if val := ctx.Value(requestmeta.RequestOverlapKey); val.(string) != "" {
-			panic("failed to configure required overlap key for request")
+		if md, ok := metadata.FromOutgoingContext(ctx); ok {
+			if len(md.Get(string(requestmeta.RequestOverlapKey))) > 0 {
+				return
+			}
 		}
+		panic("failed to configure required overlap key for request")
 	}
 }
 
