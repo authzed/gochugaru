@@ -84,7 +84,7 @@ func ExampleClient_ReadRelationships() {
 
 	var txn rel.Txn
 	txn.Create(rel.MustFromTriple("document:README", "reader", "user:jimmy"))
-	if _, err := c.Write(ctx, &txn); err != nil {
+	if _, err := c.Write(ctx, txn); err != nil {
 		panic(err)
 	}
 
@@ -118,7 +118,7 @@ func TestClient_LookupResources(t *testing.T) {
 	txn.Create(rel.MustFromTriple("document:check_test1", "reader", "user:bob"))
 	txn.Create(rel.MustFromTriple("document:check_test1", "writer", "user:charlie"))
 	txn.Create(rel.MustFromTriple("document:check_test2", "writer", "user:charlie"))
-	_, err = c.Write(ctx, &txn)
+	_, err = c.Write(ctx, txn)
 	require.NoError(t, err, "Failed to write relationships")
 
 	t.Run("lookup resources - document objects returned", func(t *testing.T) {
@@ -151,7 +151,7 @@ func TestClient_Check(t *testing.T) {
 	txn.Create(rel.MustFromTriple("document:check_test1", "writer", "user:alice"))
 	txn.Create(rel.MustFromTriple("document:check_test1", "reader", "user:bob"))
 	txn.Create(rel.MustFromTriple("document:check_test2", "writer", "user:charlie"))
-	_, err = c.Write(ctx, &txn)
+	_, err = c.Write(ctx, txn)
 	require.NoError(t, err, "Failed to write relationships")
 
 	t.Run("single relationship check - has permission", func(t *testing.T) {

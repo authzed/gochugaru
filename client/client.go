@@ -115,7 +115,7 @@ func (c *Client) connect(endpoint string) (err error) {
 }
 
 // Write atomically performs a transaction on relationships.
-func (c *Client) Write(ctx context.Context, txn *rel.Txn) (writtenAtRevision string, err error) {
+func (c *Client) Write(ctx context.Context, txn rel.Txn) (writtenAtRevision string, err error) {
 	resp, err := c.client.WriteRelationships(ctx, &v1.WriteRelationshipsRequest{
 		Updates:               txn.V1Updates,
 		OptionalPreconditions: txn.V1Preconds,
@@ -436,7 +436,7 @@ func (c *Client) WriteSchema(ctx context.Context, schema string) (revision strin
 
 // ImportRelationships is similar to Write, but is optimized for performing
 // full restorations of SpiceDB.
-func (c *Client) ImportRelationships(ctx context.Context, rs iter.Seq[rel.Interface], touchOnFail bool) error {
+func (c *Client) ImportRelationships(ctx context.Context, rs iter.Seq[rel.Interface]) error {
 	stream, err := c.client.BulkImportRelationships(ctx)
 	if err != nil {
 		return err
@@ -447,9 +447,18 @@ func (c *Client) ImportRelationships(ctx context.Context, rs iter.Seq[rel.Interf
 	})
 
 	for rs := range itz.Chunk(v1rs, 1000) {
-		if err := stream.Send(&v1.BulkImportRelationshipsRequest{
-			Relationships: rs,
-		}); err != nil {
+		err := stream.Send(&v1.BulkImportRelationshipsRequest{Relationships: rs})
+		if isGrpcCode(err, codes.AlreadyExists) {
+			if _, err := retryRetriableErrors(ctx, func() (string, error) {
+				var txn rel.Txn
+				for _, r := range rs {
+					txn.Touch(*rel.FromV1Proto(r))
+				}
+				return c.Write(ctx, txn)
+			}); err != nil {
+				return err
+			}
+		} else if err != nil {
 			return err
 		}
 	}
