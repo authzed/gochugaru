@@ -5,7 +5,6 @@ package client
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"iter"
 	"slices"
@@ -300,7 +299,7 @@ func (c *Client) ReadRelationships(ctx context.Context, cs *consistency.Strategy
 			return
 		}
 
-		for resp, err := stream.Recv(); err != io.EOF; resp, err = stream.Recv() {
+		for msg, err := stream.Recv(); !errors.Is(err, io.EOF); msg, err = stream.Recv() {
 			if err != nil {
 				yield(nil, err)
 				return
@@ -308,7 +307,7 @@ func (c *Client) ReadRelationships(ctx context.Context, cs *consistency.Strategy
 				yield(nil, err)
 				return
 			}
-			if !yield(rel.FromV1Proto(resp.Relationship), nil) {
+			if !yield(rel.FromV1Proto(msg.Relationship), nil) {
 				return
 			}
 		}
@@ -470,40 +469,29 @@ func (c *Client) ImportRelationships(ctx context.Context, rs iter.Seq[rel.Interf
 //
 // A proper backup should include relationships and schema, so this function
 // should be called with the same revision as said schema.
-func (c *Client) ExportRelationships(ctx context.Context, fn rel.Func, revision string) error {
+func (c *Client) ExportRelationships(ctx context.Context, revision string) iter.Seq2[*rel.Relationship, error] {
 	c.checkOverlap(ctx)
 
-	relationshipStream, err := c.client.BulkExportRelationships(ctx, &v1.BulkExportRelationshipsRequest{
-		Consistency: &v1.Consistency{
-			Requirement: &v1.Consistency_AtExactSnapshot{
+	return func(yield func(*rel.Relationship, error) bool) {
+		stream, err := c.client.BulkExportRelationships(ctx, &v1.BulkExportRelationshipsRequest{
+			Consistency: &v1.Consistency{Requirement: &v1.Consistency_AtExactSnapshot{
 				AtExactSnapshot: &v1.ZedToken{Token: revision},
-			},
-		},
-	})
-	if err != nil {
-		return err
-	}
+			}},
+		})
+		if err != nil {
+			yield(nil, err)
+			return
+		}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-			if err := ctx.Err(); err != nil {
-				return fmt.Errorf("aborted backup: %w", err)
-			}
-
-			relsResp, err := relationshipStream.Recv()
+		for msg, err := stream.Recv(); !errors.Is(err, io.EOF); msg, err = stream.Recv() {
 			if err != nil {
-				if errors.Is(err, io.EOF) {
-					return nil
-				}
-				return fmt.Errorf("error receiving relationships: %w", err)
+				yield(nil, err)
+				return
 			}
 
-			for _, r := range relsResp.Relationships {
-				if err := fn(rel.FromV1Proto(r)); err != nil {
-					return err
+			for _, r := range msg.Relationships {
+				if !yield(rel.FromV1Proto(r), nil) {
+					return
 				}
 			}
 		}
@@ -551,18 +539,13 @@ func (c *Client) LookupResources(ctx context.Context, cs *consistency.Strategy, 
 			return
 		}
 
-		for {
-			msg, err := stream.Recv()
-			switch {
-			case errors.Is(err, io.EOF):
-				return
-			case err != nil:
+		for msg, err := stream.Recv(); !errors.Is(err, io.EOF); msg, err = stream.Recv() {
+			if err != nil {
 				yield("", err)
 				return
-			default:
-				if !yield(msg.ResourceObjectId, nil) {
-					return
-				}
+			}
+			if !yield(msg.ResourceObjectId, nil) {
+				return
 			}
 		}
 	}
@@ -603,18 +586,13 @@ func (c *Client) LookupSubjects(ctx context.Context, cs *consistency.Strategy, r
 			return
 		}
 
-		for {
-			msg, err := stream.Recv()
-			switch {
-			case errors.Is(err, io.EOF):
-				return
-			case err != nil:
+		for msg, err := stream.Recv(); !errors.Is(err, io.EOF); msg, err = stream.Recv() {
+			if err != nil {
 				yield("", err)
 				return
-			default:
-				if !yield(msg.GetSubject().SubjectObjectId, nil) {
-					return
-				}
+			}
+			if !yield(msg.GetSubject().SubjectObjectId, nil) {
+				return
 			}
 		}
 	}

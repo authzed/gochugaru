@@ -264,8 +264,6 @@ func FromTuple(resource, subject string) (Relationship, error) {
 	return r, nil
 }
 
-type Func func(r *Relationship) error
-
 type UpdateType int
 
 const (

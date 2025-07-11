@@ -237,7 +237,7 @@ func TestMissingOverlapPanic(t *testing.T) {
 	})
 	t.Run("Missing Overlap Panics - ExportRelationships", func(t *testing.T) {
 		defer func() { _ = recover() }()
-		_ = c.ExportRelationships(ctx, func(r *rel.Relationship) error { return nil }, "")
+		_ = c.ExportRelationships(ctx, "")
 		t.Fatal("did not panic when overlap not provided")
 	})
 
