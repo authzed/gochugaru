@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"slices"
 	"strings"
 	"time"
 
@@ -15,16 +16,14 @@ import (
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 	"github.com/authzed/authzed-go/v1"
 	"github.com/authzed/grpcutil"
-	"github.com/cenkalti/backoff/v4"
-	"github.com/jzelinskie/stringz"
-	"golang.org/x/exp/slices"
+	"github.com/cenkalti/backoff/v5"
+	"github.com/jzelinskie/itz"
+	_ "github.com/mostynb/go-grpc-compression/experimental/s2" // Register Snappy S2 compression
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-
-	_ "github.com/mostynb/go-grpc-compression/experimental/s2" // Register Snappy S2 compression
 
 	"github.com/authzed/gochugaru/consistency"
 	"github.com/authzed/gochugaru/rel"
@@ -137,7 +136,7 @@ func (c *Client) CheckOne(ctx context.Context, cs *consistency.Strategy, r rel.I
 }
 
 // CheckAny returns true if any of the provided relationships have access.
-func (c *Client) CheckAny(ctx context.Context, cs *consistency.Strategy, rs []rel.Interface) (bool, error) {
+func (c *Client) CheckAny(ctx context.Context, cs *consistency.Strategy, rs ...rel.Interface) (bool, error) {
 	results, err := c.Check(ctx, cs, rs...)
 	if err != nil {
 		return false, err
@@ -147,7 +146,7 @@ func (c *Client) CheckAny(ctx context.Context, cs *consistency.Strategy, rs []re
 }
 
 // CheckAll returns true if all of the provided relationships have access.
-func (c *Client) CheckAll(ctx context.Context, cs *consistency.Strategy, rs []rel.Interface) (bool, error) {
+func (c *Client) CheckAll(ctx context.Context, cs *consistency.Strategy, rs ...rel.Interface) (bool, error) {
 	results, err := c.Check(ctx, cs, rs...)
 	if err != nil {
 		return false, err
@@ -161,6 +160,26 @@ func (c *Client) CheckAll(ctx context.Context, cs *consistency.Strategy, rs []re
 	return true, nil
 }
 
+// CheckIter iterates over the provided relationships, batching them into
+// requests, and returns an iterator of their results.
+func (c *Client) CheckIter(ctx context.Context, cs *consistency.Strategy, rs iter.Seq[rel.Interface]) iter.Seq2[bool, error] {
+	return func(yield func(bool, error) bool) {
+		for items := range itz.Chunk(rs, 1000) {
+			checks, err := c.Check(ctx, cs, items...)
+			if err != nil {
+				yield(false, err)
+				return
+			}
+
+			for _, check := range checks {
+				if !yield(check, nil) {
+					return
+				}
+			}
+		}
+	}
+}
+
 func (c *Client) checkOverlap(ctx context.Context) {
 	if c.overlapRequired {
 		if md, ok := metadata.FromOutgoingContext(ctx); ok {
@@ -172,50 +191,24 @@ func (c *Client) checkOverlap(ctx context.Context) {
 	}
 }
 
-// withBackoffRetriesAndTimeout is a utility to wrap an API call with retry
-// and backoff logic based on the error or gRPC status code.
-func withBackoffRetriesAndTimeout(ctx context.Context, fn func(context.Context) error) error {
-	backoffInterval := backoff.NewExponentialBackOff()
-	backoffInterval.InitialInterval = 50 * time.Millisecond
-	backoffInterval.MaxInterval = 2 * time.Second
-	backoffInterval.MaxElapsedTime = 0
-	backoffInterval.Reset()
-
-	maxRetries := 10
-	defaultTimeout := 30 * time.Second
-
-	for retryCount := 0; ; retryCount++ {
-		cancelCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
-		err := fn(cancelCtx)
-		if err == nil {
-			cancel()
-			return nil
+func retryRetriableErrors[T any](ctx context.Context, fn func() (T, error)) (T, error) {
+	retriableFunc := func() (T, error) {
+		result, err := fn()
+		if isGrpcCode(err, codes.Unavailable, codes.DeadlineExceeded) ||
+			errContainsAny(err, "retryable error", "try restarting transaction") || // SpiceDB < v1.30 need this to properly retry.
+			errors.Is(err, context.DeadlineExceeded) {
+			return result, err
 		}
 
-		cancel()
-
-		if isRetriable(err) && retryCount < maxRetries {
-			time.Sleep(backoffInterval.NextBackOff())
-			retryCount++
-			continue
-		}
-		break
+		return result, backoff.Permanent(err)
 	}
-	return errors.New("max retries exceeded")
-}
 
-// isRetriable determines whether or not an error returned by the gRPC client
-// can be retried.
-func isRetriable(err error) bool {
-	switch {
-	case err == nil:
-		return false
-	case isGrpcCode(err, codes.Unavailable, codes.DeadlineExceeded):
-		return true
-	case errContains(err, "retryable error", "try restarting transaction"):
-		return true // SpiceDB < v1.30 need this to properly retry.
-	}
-	return errors.Is(err, context.DeadlineExceeded)
+	return backoff.Retry(ctx, retriableFunc, backoff.WithBackOff(&backoff.ExponentialBackOff{
+		InitialInterval:     50 * time.Millisecond,
+		RandomizationFactor: backoff.DefaultRandomizationFactor,
+		Multiplier:          backoff.DefaultMultiplier,
+		MaxInterval:         2 * time.Second,
+	}))
 }
 
 func isGrpcCode(err error, codes ...codes.Code) bool {
@@ -229,7 +222,7 @@ func isGrpcCode(err error, codes ...codes.Code) bool {
 	return false
 }
 
-func errContains(err error, errStrs ...string) bool {
+func errContainsAny(err error, errStrs ...string) bool {
 	if err == nil {
 		return false
 	}
@@ -266,24 +259,18 @@ func (c *Client) Check(ctx context.Context, cs *consistency.Strategy, rs ...rel.
 		})
 	}
 
-	var foundResp *v1.CheckBulkPermissionsResponse
-	if err := withBackoffRetriesAndTimeout(ctx, func(ctx context.Context) error {
-		resp, err := c.client.CheckBulkPermissions(ctx, &v1.CheckBulkPermissionsRequest{
+	resp, err := retryRetriableErrors(ctx, func() (*v1.CheckBulkPermissionsResponse, error) {
+		return c.client.CheckBulkPermissions(ctx, &v1.CheckBulkPermissionsRequest{
 			Consistency: cs.V1Consistency,
 			Items:       items,
 		})
-		if err != nil {
-			return err
-		}
-
-		foundResp = resp
-		return nil
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
 
 	var results []bool
-	for _, pair := range foundResp.Pairs {
+	for _, pair := range resp.Pairs {
 		switch resp := pair.Response.(type) {
 		case *v1.CheckBulkPermissionsPair_Item:
 			results = append(
@@ -297,9 +284,9 @@ func (c *Client) Check(ctx context.Context, cs *consistency.Strategy, rs ...rel.
 	return results, nil
 }
 
-// FilterRelationships returns an iterator for all of the relationships
-// matching the provided filter.
-func (c *Client) FilterRelationships(ctx context.Context, cs *consistency.Strategy, f *rel.Filter) iter.Seq2[*rel.Relationship, error] {
+// ReadRelationships returns an iterator for all of the relationships matching
+// the provided filter.
+func (c *Client) ReadRelationships(ctx context.Context, cs *consistency.Strategy, f *rel.Filter) iter.Seq2[*rel.Relationship, error] {
 	c.checkOverlap(ctx)
 
 	return func(yield func(*rel.Relationship, error) bool) {
@@ -355,22 +342,20 @@ func (c *Client) Delete(ctx context.Context, f *rel.PreconditionedFilter) error 
 	c.checkOverlap(ctx)
 
 	for {
-		var resp *v1.DeleteRelationshipsResponse
-		if err := withBackoffRetriesAndTimeout(ctx, func(cCtx context.Context) (cErr error) {
-			resp, cErr = c.client.DeleteRelationships(cCtx, &v1.DeleteRelationshipsRequest{
+		resp, err := retryRetriableErrors(ctx, func() (*v1.DeleteRelationshipsResponse, error) {
+			return c.client.DeleteRelationships(ctx, &v1.DeleteRelationshipsRequest{
 				RelationshipFilter:            f.V1Filter,
 				OptionalPreconditions:         f.V1Preconds,
 				OptionalLimit:                 10_000,
 				OptionalAllowPartialDeletions: false,
 			})
-			return cErr
-		}); err != nil {
+		})
+		if err != nil {
 			return err
 		} else if resp.DeletionProgress == v1.DeleteRelationshipsResponse_DELETION_PROGRESS_COMPLETE {
-			break
+			return nil
 		}
 	}
-	return nil
 }
 
 // Updates returns an iterator that's subscribed to optionally-filtered updates
@@ -392,15 +377,16 @@ func (c *Client) UpdatesSinceRevision(ctx context.Context, f rel.UpdateFilter, r
 			v1filters = append(v1filters, f.V1Filter)
 		}
 
-		req := &v1.WatchRequest{
-			OptionalObjectTypes:         f.ObjectTypes,
-			OptionalRelationshipFilters: v1filters,
-		}
+		var zedtoken *v1.ZedToken
 		if revision != "" {
-			req.OptionalStartCursor = &v1.ZedToken{Token: revision}
+			zedtoken = &v1.ZedToken{Token: revision}
 		}
 
-		watchStream, err := c.client.Watch(ctx, req)
+		watchStream, err := c.client.Watch(ctx, &v1.WatchRequest{
+			OptionalObjectTypes:         f.ObjectTypes,
+			OptionalRelationshipFilters: v1filters,
+			OptionalStartCursor:         zedtoken,
+		})
 		if err != nil {
 			yield(rel.Update{}, err)
 			return
@@ -448,6 +434,28 @@ func (c *Client) WriteSchema(ctx context.Context, schema string) (revision strin
 	return resp.WrittenAt.Token, nil
 }
 
+// ImportRelationships is similar to Write, but is optimized for performing
+// full restorations of SpiceDB.
+func (c *Client) ImportRelationships(ctx context.Context, rs iter.Seq[rel.Interface], touchOnFail bool) error {
+	stream, err := c.client.BulkImportRelationships(ctx)
+	if err != nil {
+		return err
+	}
+
+	v1rs := itz.Map(rs, func(ir rel.Interface) *v1.Relationship {
+		return ir.Relationship().V1()
+	})
+
+	for rs := range itz.Chunk(v1rs, 1000) {
+		if err := stream.Send(&v1.BulkImportRelationshipsRequest{
+			Relationships: rs,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ExportRelationships is similar to ReadRelationships, but cannot be filtered
 // and is optimized for performing full backups of SpiceDB.
 //
@@ -493,21 +501,6 @@ func (c *Client) ExportRelationships(ctx context.Context, fn rel.Func, revision 
 	}
 }
 
-// parseSubject parses the given subject string into its namespace, object ID
-// and relation, if valid.
-func parseSubject(s string) (subjType, id, relation string, err error) {
-	err = stringz.SplitExact(s, ":", &subjType, &id)
-	if err != nil {
-		return
-	}
-	err = stringz.SplitExact(id, "#", &id, &relation)
-	if err != nil {
-		relation = ""
-		err = nil
-	}
-	return
-}
-
 // LookupResources streams a sequence of resource IDs for which the provided
 // subject has permission.
 //
@@ -519,15 +512,15 @@ func (c *Client) LookupResources(ctx context.Context, cs *consistency.Strategy, 
 	c.checkOverlap(ctx)
 
 	return func(yield func(string, error) bool) {
-		subjType, subjID, subjRel, err := parseSubject(subject)
+		subjType, subjID, subjRel, err := rel.ParseObjectSet(subject)
 		if err != nil {
 			yield("", err)
 			return
 		}
 
-		objType, objRel, found := strings.Cut(permission, "#")
-		if !found {
-			yield("", errors.New("invalid permission arg; must be in form `objectType#relation` (e.g. document#read)"))
+		objType, objRel, err := rel.ParseTypedRelation(permission)
+		if err != nil {
+			yield("", err)
 			return
 		}
 
@@ -541,9 +534,8 @@ func (c *Client) LookupResources(ctx context.Context, cs *consistency.Strategy, 
 				},
 				OptionalRelation: subjRel,
 			},
-			Context:       nil, // TODO(jzelinskie): maybe caveats get injected into ctx?
-			Consistency:   cs.V1Consistency,
-			OptionalLimit: 512,
+			Context:     nil, // TODO(jzelinskie): maybe caveats get injected into ctx?
+			Consistency: cs.V1Consistency,
 		})
 		if err != nil {
 			yield("", err)
@@ -551,7 +543,7 @@ func (c *Client) LookupResources(ctx context.Context, cs *consistency.Strategy, 
 		}
 
 		for {
-			resp, err := stream.Recv()
+			msg, err := stream.Recv()
 			switch {
 			case errors.Is(err, io.EOF):
 				return
@@ -559,7 +551,59 @@ func (c *Client) LookupResources(ctx context.Context, cs *consistency.Strategy, 
 				yield("", err)
 				return
 			default:
-				if !yield(resp.ResourceObjectId, nil) {
+				if !yield(msg.ResourceObjectId, nil) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// LookupSubjects streams a sequence of subject IDs of the subjects that have
+// permissionship with the provided resource and permission.
+//
+// The string arguments are provided in the following format:
+// `LookupSubjects(ctx, consistency.MinLatency(), "document:README", "editor", "user")`
+// or
+// `LookupSubjects(ctx, consistency.MinLatency(), "document:README", "editor", "team#member"
+func (c *Client) LookupSubjects(ctx context.Context, cs *consistency.Strategy, resource, permission, subject string) iter.Seq2[string, error] {
+	c.checkOverlap(ctx)
+
+	return func(yield func(string, error) bool) {
+		resType, resID, _, err := rel.ParseObjectSet(resource)
+		if err != nil {
+			yield("", err)
+			return
+		}
+
+		subjType, subjRel, _ := strings.Cut(subject, "#")
+
+		stream, err := c.client.LookupSubjects(ctx, &v1.LookupSubjectsRequest{
+			Resource: &v1.ObjectReference{
+				ObjectType: resType,
+				ObjectId:   resID,
+			},
+			Permission:              permission,
+			SubjectObjectType:       subjType,
+			OptionalSubjectRelation: subjRel,
+			Context:                 nil, // TODO(jzelinskie): maybe caveats get injected into ctx?
+			Consistency:             cs.V1Consistency,
+		})
+		if err != nil {
+			yield("", err)
+			return
+		}
+
+		for {
+			msg, err := stream.Recv()
+			switch {
+			case errors.Is(err, io.EOF):
+				return
+			case err != nil:
+				yield("", err)
+				return
+			default:
+				if !yield(msg.GetSubject().SubjectObjectId, nil) {
 					return
 				}
 			}

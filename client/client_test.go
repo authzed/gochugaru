@@ -70,7 +70,7 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
-func ExampleClient_FilterRelationships() {
+func ExampleClient_ReadRelationships() {
 	ctx := context.TODO()
 
 	c, err := client.NewPlaintext("127.0.0.1:50051", randomPresharedKey())
@@ -88,7 +88,7 @@ func ExampleClient_FilterRelationships() {
 		panic(err)
 	}
 
-	iter := c.FilterRelationships(
+	iter := c.ReadRelationships(
 		ctx,
 		consistency.MinLatency(),
 		rel.NewFilter("document", "", ""),
@@ -232,7 +232,7 @@ func TestMissingOverlapPanic(t *testing.T) {
 
 	t.Run("Missing Overlap Panics - ReadRelationships", func(t *testing.T) {
 		defer func() { _ = recover() }()
-		_ = c.FilterRelationships(ctx, consistency.Full(), rel.NewFilter("document", "", ""))
+		_ = c.ReadRelationships(ctx, consistency.Full(), rel.NewFilter("document", "", ""))
 		t.Fatal("did not panic when overlap not provided")
 	})
 	t.Run("Missing Overlap Panics - ExportRelationships", func(t *testing.T) {

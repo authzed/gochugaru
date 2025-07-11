@@ -34,7 +34,7 @@ func (b *Txn) MustNotMatch(f *Filter) {
 func (b *Txn) Touch(r Relationship) {
 	b.V1Updates = append(b.V1Updates, &v1.RelationshipUpdate{
 		Operation:    v1.RelationshipUpdate_OPERATION_TOUCH,
-		Relationship: r.v1(),
+		Relationship: r.V1(),
 	})
 }
 
@@ -43,7 +43,7 @@ func (b *Txn) Touch(r Relationship) {
 func (b *Txn) Create(r Relationship) {
 	b.V1Updates = append(b.V1Updates, &v1.RelationshipUpdate{
 		Operation:    v1.RelationshipUpdate_OPERATION_CREATE,
-		Relationship: r.v1(),
+		Relationship: r.V1(),
 	})
 }
 
@@ -51,6 +51,6 @@ func (b *Txn) Create(r Relationship) {
 func (b *Txn) Delete(r Relationship) {
 	b.V1Updates = append(b.V1Updates, &v1.RelationshipUpdate{
 		Operation:    v1.RelationshipUpdate_OPERATION_DELETE,
-		Relationship: r.v1(),
+		Relationship: r.V1(),
 	})
 }

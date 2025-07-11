@@ -95,7 +95,7 @@ func (r Relationship) Filter() *Filter {
 	return f
 }
 
-func (r Relationship) v1() *v1.Relationship {
+func (r Relationship) V1() *v1.Relationship {
 	return &v1.Relationship{
 		Resource: &v1.ObjectReference{
 			ObjectType: r.ResourceType,
