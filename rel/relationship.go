@@ -3,10 +3,14 @@ package rel
 import (
 	"errors"
 	"strings"
+	"time"
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+var expirationFormat = time.RFC3339Nano
 
 var (
 	// ErrInvalidResource is a catch-all error when a resource is invalid.
@@ -30,11 +34,15 @@ type Relationship struct {
 	SubjectRelation  string
 	CaveatName       string
 	CaveatContext    map[string]any
+	Expiration       *time.Time
 }
 
 func (r Relationship) Relationship() Relationship { return r }
 func (r Relationship) Permission() string         { return r.ResourceRelation }
 func (r Relationship) HasCaveat() bool            { return r.CaveatName != "" }
+func (r Relationship) HasExpiration() bool {
+	return r.Expiration != nil && !r.Expiration.IsZero()
+}
 
 func (r Relationship) Caveat() (name string, context map[string]any, exists bool) {
 	return r.CaveatName, r.CaveatContext, r.HasCaveat()
@@ -73,9 +81,15 @@ func (r Relationship) String() string {
 		}
 		b.WriteString("]")
 	}
+	if r.HasExpiration() {
+		b.WriteString("[expiration:")
+		b.WriteString(r.Expiration.Format(expirationFormat))
+		b.WriteString("]")
+	}
 	return b.String()
 }
 
+// WithCaveat sets the caveat for the relationship.
 func (r Relationship) WithCaveat(name string, context map[string]any) Relationship {
 	return Relationship{
 		ResourceType:     r.ResourceType,
@@ -86,6 +100,22 @@ func (r Relationship) WithCaveat(name string, context map[string]any) Relationsh
 		SubjectRelation:  r.SubjectRelation,
 		CaveatName:       name,
 		CaveatContext:    context,
+		Expiration:       r.Expiration,
+	}
+}
+
+// WithExpiration sets the expiration time for the relationship.
+func (r Relationship) WithExpiration(expiration time.Time) Relationship {
+	return Relationship{
+		ResourceType:     r.ResourceType,
+		ResourceID:       r.ResourceID,
+		ResourceRelation: r.ResourceRelation,
+		SubjectType:      r.SubjectType,
+		SubjectID:        r.SubjectID,
+		SubjectRelation:  r.SubjectRelation,
+		CaveatName:       r.CaveatName,
+		CaveatContext:    r.CaveatContext,
+		Expiration:       &expiration,
 	}
 }
 
@@ -109,7 +139,8 @@ func (r Relationship) V1() *v1.Relationship {
 			},
 			OptionalRelation: r.SubjectRelation,
 		},
-		OptionalCaveat: r.MustV1ProtoCaveat(),
+		OptionalCaveat:    r.MustV1ProtoCaveat(),
+		OptionalExpiresAt: r.V1Expiration(),
 	}
 }
 
@@ -121,6 +152,12 @@ func FromV1Proto(r *v1.Relationship) *Relationship {
 		caveatContext = r.OptionalCaveat.Context.AsMap()
 	}
 
+	var expiration *time.Time
+	if r.OptionalExpiresAt != nil {
+		t := r.OptionalExpiresAt.AsTime()
+		expiration = &t
+	}
+
 	return &Relationship{
 		ResourceType:     r.Resource.ObjectType,
 		ResourceID:       r.Resource.ObjectId,
@@ -130,6 +167,7 @@ func FromV1Proto(r *v1.Relationship) *Relationship {
 		SubjectRelation:  r.Subject.OptionalRelation,
 		CaveatName:       caveatName,
 		CaveatContext:    caveatContext,
+		Expiration:       expiration,
 	}
 }
 
@@ -147,6 +185,14 @@ func (r Relationship) MustV1ProtoCaveat() *v1.ContextualizedCaveat {
 	}
 
 	return nil
+}
+
+func (r Relationship) V1Expiration() *timestamppb.Timestamp {
+	if !r.HasExpiration() {
+		return nil
+	}
+
+	return timestamppb.New(*r.Expiration)
 }
 
 type Object struct {
